@@ -1,11 +1,16 @@
+import io
 import os
 import re
+import numpy as np
 import requests
 import soundfile as sf
 from kittentts import KittenTTS as KittenModel
 
 from config import (
     ROOT_DIR,
+    get_deepgram_api_key,
+    get_deepgram_tts_model,
+    get_edge_tts_voice,
     get_openai_api_key,
     get_openai_base_url,
     get_openai_tts_model,
@@ -18,6 +23,7 @@ from status import warning
 
 KITTEN_MODEL = "KittenML/kitten-tts-mini-0.8"
 KITTEN_SAMPLE_RATE = 24000
+DEEPGRAM_MAX_CHARS = 2000  # Deepgram /v1/speak rejects longer inputs
 
 class TTS:
     def __init__(self) -> None:
@@ -37,21 +43,114 @@ class TTS:
         if not text:
             raise ValueError("Cannot synthesize empty text.")
 
+        # Paid providers only run when the free ones before them fail.
+        # Deepgram Aura-2 has no Arabic voices, so it only backs up English.
+        attempts = []
+        if self._provider == "edge":
+            attempts.append(("Edge TTS", self._synthesize_edge))
+            if get_deepgram_api_key() and not self._is_arabic_narration(text, language, dialect):
+                attempts.append(("Deepgram TTS", self._synthesize_deepgram))
         if self._should_use_openai_tts(text, language, dialect):
+            attempts.append(("OpenAI TTS", self._synthesize_openai))
+
+        for label, synthesize_with in attempts:
             try:
-                return self._synthesize_openai(
+                return synthesize_with(
                     text,
                     output_file,
                     language,
                     dialect,
                     cost_callback=cost_callback,
                 )
-            except Exception as openai_error:
-                warning(
-                    f"OpenAI TTS failed for this narration. Falling back to KittenTTS: {openai_error}"
-                )
+            except Exception as provider_error:
+                warning(f"{label} failed for this narration, trying the next provider: {provider_error}")
 
         return self._synthesize_kitten(text, output_file, cost_callback=cost_callback)
+
+    def _synthesize_edge(
+        self,
+        text: str,
+        output_file: str,
+        language: str | None = None,
+        dialect: str | None = None,
+        cost_callback=None,
+    ) -> str:
+        # ponytail: unofficial free Microsoft endpoint, can break without notice;
+        # the provider chain in synthesize() is the safety net.
+        import asyncio
+        import edge_tts
+
+        voice = get_edge_tts_voice()
+        mp3_path = f"{os.path.splitext(output_file)[0]}.edge.mp3"
+        asyncio.run(edge_tts.Communicate(text, voice).save(mp3_path))
+        audio, sample_rate = sf.read(mp3_path)
+        os.remove(mp3_path)
+        sf.write(output_file, audio, sample_rate)
+
+        if cost_callback:
+            cost_callback(
+                {
+                    "provider": "edge",
+                    "model": "edge-neural",
+                    "audio_seconds": len(audio) / float(sample_rate),
+                    "characters": len(text),
+                    "voice": voice,
+                }
+            )
+        return output_file
+
+    def _synthesize_deepgram(
+        self,
+        text: str,
+        output_file: str,
+        language: str | None = None,
+        dialect: str | None = None,
+        cost_callback=None,
+    ) -> str:
+        model = get_deepgram_tts_model()
+        chunks = []
+        for chunk_text in self._split_for_char_limit(text, DEEPGRAM_MAX_CHARS):
+            response = requests.post(
+                "https://api.deepgram.com/v1/speak",
+                params={"model": model, "encoding": "linear16", "container": "wav"},
+                headers={"Authorization": f"Token {get_deepgram_api_key()}"},
+                json={"text": chunk_text},
+                timeout=120,
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Deepgram TTS request failed with status {response.status_code}: {response.text.strip()}"
+                )
+            audio, sample_rate = sf.read(io.BytesIO(response.content))
+            chunks.append(audio)
+
+        audio = np.concatenate(chunks)
+        sf.write(output_file, audio, sample_rate)
+
+        if cost_callback:
+            cost_callback(
+                {
+                    "provider": "deepgram",
+                    "model": model,
+                    "audio_seconds": len(audio) / float(sample_rate),
+                    "characters": len(text),
+                    "voice": model,
+                }
+            )
+        return output_file
+
+    def _split_for_char_limit(self, text: str, max_chars: int) -> list[str]:
+        """Packs whole sentences into chunks no longer than max_chars."""
+        chunks = [""]
+        for sentence in re.split(r"(?<=[.!?؟…])\s+", text):
+            while len(sentence) > max_chars:
+                chunks.append(sentence[:max_chars])
+                sentence = sentence[max_chars:]
+            if len(chunks[-1]) + len(sentence) + 1 > max_chars:
+                chunks.append(sentence)
+            else:
+                chunks[-1] = f"{chunks[-1]} {sentence}".strip()
+        return [chunk for chunk in chunks if chunk]
 
     def _get_kitten_model(self):
         if self._model is None:
@@ -103,11 +202,19 @@ class TTS:
         if not get_openai_api_key():
             return False
 
-        normalized_language = str(language or "").strip().lower()
-        normalized_dialect = str(dialect or "").strip().lower()
         if provider == "openai":
             return True
 
+        return self._is_arabic_narration(text, language, dialect)
+
+    def _is_arabic_narration(
+        self,
+        text: str,
+        language: str | None = None,
+        dialect: str | None = None,
+    ) -> bool:
+        normalized_language = str(language or "").strip().lower()
+        normalized_dialect = str(dialect or "").strip().lower()
         return (
             self._contains_arabic(text)
             or "arabic" in normalized_language

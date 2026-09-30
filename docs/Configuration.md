@@ -13,14 +13,19 @@ All your configurations will be in a file in the root directory, called `config.
 - `openai_base_url`: `string` - Base URL for the OpenAI API (default: `https://api.openai.com/v1`).
 - `openai_api_key`: `string` - OpenAI API key. If empty, MPV2 falls back to the `OPENAI_API_KEY` environment variable.
 - `openai_model`: `string` - OpenAI model used when `llm_provider` is `openai` (default example: `gpt-5-mini`).
-- `image_provider`: `string` - Image generation provider. Supported values: `nanobanana2`, `openai`, `openrouter`.
-- `asset_strategy`: `string` - Visual sourcing strategy for videos. Supported values: `mixed`, `pixabay_only`, `ai_only`. `mixed` uses Pixabay stock first and only falls back to a limited number of AI-generated visuals.
+- `image_provider`: `string` - Image generation provider. Supported values: `nanobanana2`, `openai`, `openrouter`, `qwen_local`.
+- `asset_strategy`: `string` - Visual sourcing strategy for videos. Supported values: `mixed`, `pixabay_only`, `ai_only`. `mixed` uses Pixabay stock first and only falls back to a limited number of AI-generated visuals. `pixabay_only` always uses the best stock clip found for each scene, even when it scores below the AI-fallback threshold, so clips are not repeated across scenes.
 - `max_ai_assets`: `number` - Maximum number of AI-generated visuals allowed per video when `asset_strategy` is `mixed` (default: `2`).
 - `openai_image_model`: `string` - OpenAI image model used when `image_provider` is `openai` (default example: `gpt-image-1`).
 - `openai_image_quality`: `string` - OpenAI image quality setting (`low`, `medium`, or `high`).
 - `openrouter_api_key`: `string` - OpenRouter API key. If empty, MPV2 falls back to the `OPENROUTER_API_KEY` environment variable.
 - `openrouter_image_model`: `string` - OpenRouter image model used when `image_provider` is `openrouter` (default example: `black-forest-labs/flux.2-flex`).
+- `qwen_api_base_url`: `string` - Base URL of a self-hosted Qwen-Image server (`scripts/qwen_server.py`), used when `image_provider` is `qwen_local` (default: `http://127.0.0.1:8189`). Point it at a rented GPU while batch-rendering. Images cost $0.00 regardless of host.
+- `qwen_api_key`: `string` - Shared bearer token for the Qwen-Image server. Optional on loopback, but the server refuses to bind a non-loopback address without one. Falls back to the `QWEN_API_KEY` environment variable.
+- `qwen_steps`: `number` - Qwen-Image sampling steps (default: `30`). The main quality/speed dial: `50` matches the reference config, `20`-`25` renders roughly twice as fast.
+- `qwen_request_timeout`: `number` - HTTP timeout in seconds for Qwen-Image requests (default: `1800`). Much higher than `image_request_timeout` because a 20B model with CPU offload can take many minutes per image.
 - `pixabay_api_key`: `string` - Pixabay API key for free stock image/video lookup. If empty, Pixabay-based strategies will not be able to fetch stock media.
+- `pexels_api_key`: `string` - Optional free Pexels API key. When set, Pexels portrait videos/photos are searched alongside Pixabay and ranked by the same scorer (free tier: 200 requests/hour; the run falls back to Pixabay only if it is hit).
 - `twitter_language`: `string` - The base language that will be used to generate & post tweets.
 - `twitter_dialect`: `string` - Optional dialect/local style for tweets, for example `Egyptian Arabic`, `Gulf Arabic`, or `Moroccan Darija`.
 - `nanobanana2_api_base_url`: `string` - Nano Banana 2 API base URL (default: `https://generativelanguage.googleapis.com/v1beta`).
@@ -51,7 +56,10 @@ All your configurations will be in a file in the root directory, called `config.
 - `whisper_device`: `string` - Device for local Whisper (`auto`, `cpu`, `cuda`).
 - `whisper_compute_type`: `string` - Compute type for local Whisper (`int8`, `float16`, etc.).
 - `assembly_ai_api_key`: `string` - Your Assembly AI API key. Get yours from [here](https://www.assemblyai.com/app/).
-- `tts_provider`: `string` - Text-to-speech provider. Supported values: `auto`, `openai`, `kitten`. `auto` prefers OpenAI for Arabic when an OpenAI API key is configured.
+- `tts_provider`: `string` - Text-to-speech provider. Supported values: `auto`, `openai`, `kitten`, `edge`. `auto` prefers OpenAI for Arabic when an OpenAI API key is configured. `edge` uses free Microsoft Edge neural voices (unofficial endpoint) and falls back to Deepgram (English only, if `deepgram_api_key` is set), then OpenAI (Arabic, if `openai_api_key` is set), then KittenTTS.
+- `edge_tts_voice`: `string` - Edge voice for `tts_provider: edge` (default: `ar-EG-ShakirNeural`; `ar-EG-SalmaNeural` is the Egyptian female voice; `en-US-GuyNeural` etc. for English).
+- `deepgram_api_key`: `string` - Optional Deepgram key used as the English TTS fallback. Deepgram Aura-2 has no Arabic voices.
+- `deepgram_tts_model`: `string` - Deepgram Aura-2 voice model (default: `aura-2-thalia-en`).
 - `openai_tts_model`: `string` - OpenAI TTS model used when `tts_provider` resolves to OpenAI (default example: `gpt-4o-mini-tts`).
 - `openai_tts_voice`: `string` - OpenAI TTS voice used when `tts_provider` resolves to OpenAI (default example: `onyx`).
 - `subtitle_font`: `string` - Font file from the `fonts/` folder used for burned-in subtitles (default: `bold_font.ttf`).
@@ -92,6 +100,7 @@ All your configurations will be in a file in the root directory, called `config.
   "openrouter_api_key": "",
   "openrouter_image_model": "black-forest-labs/flux.2-flex",
   "pixabay_api_key": "",
+  "pexels_api_key": "",
   "twitter_language": "English",
   "twitter_dialect": "",
   "nanobanana2_api_base_url": "https://generativelanguage.googleapis.com/v1beta",
@@ -124,6 +133,9 @@ All your configurations will be in a file in the root directory, called `config.
   "tts_provider": "auto",
   "openai_tts_model": "gpt-4o-mini-tts",
   "openai_tts_voice": "onyx",
+  "edge_tts_voice": "ar-EG-ShakirNeural",
+  "deepgram_api_key": "",
+  "deepgram_tts_model": "aura-2-thalia-en",
   "subtitle_font": "bold_font.ttf",
   "subtitle_font_size": 84,
   "subtitle_color": "#FFF7D6",
@@ -150,6 +162,8 @@ All your configurations will be in a file in the root directory, called `config.
 - `OPENAI_API_KEY`: used when `openai_api_key` is empty.
 - `OPENROUTER_API_KEY`: used when `openrouter_api_key` is empty.
 - `PIXABAY_API_KEY`: used when `pixabay_api_key` is empty.
+- `PEXELS_API_KEY`: used when `pexels_api_key` is empty.
+- `DEEPGRAM_API_KEY`: used when `deepgram_api_key` is empty.
 - `POST_BRIDGE_API_KEY`: used when `post_bridge.api_key` is empty.
 
 Example:

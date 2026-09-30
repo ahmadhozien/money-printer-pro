@@ -18,6 +18,10 @@ ollama
 # Text-to-speech
 kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl
 soundfile
+edge-tts
+
+# Stock-footage rerank (CLIP); skipped automatically when not installed
+open_clip_torch
 
 # Speech-to-text (subtitles)
 faster-whisper

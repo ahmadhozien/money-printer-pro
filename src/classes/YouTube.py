@@ -65,6 +65,26 @@ DEFAULT_MAX_IMAGE_PROMPTS = 12
 IMAGE_RATE_LIMIT_RETRIES = 3
 IMAGE_RATE_LIMIT_BACKOFF_SECONDS = 5
 PIXBAY_MIN_SELECTION_SCORE = 65.0
+STOCK_CACHE_TTL_SECONDS = 86400
+# Script lines that describe visuals ("صورة المشهد: ...", "Scene: ...") and
+# short "Label:" prefixes ("مفاجأة ذكية: ..."), both of which TTS would read aloud.
+SCRIPT_DIRECTION_LINE = re.compile(
+    r"^\s*(?:صورة المشهد|في المشهد|المشهد|مشهد|وصف المشهد|scene|visual|shot|b-roll)\s*[:：]",
+    re.IGNORECASE,
+)
+SCRIPT_LABEL_PREFIX = re.compile(r"^\s*(?:[^\s:：.!?؟،,]+\s+){0,2}[^\s:：.!?؟،,]+\s*[:：]\s+")
+PORTRAIT_VIDEO_BONUS = 8.0  # 9:16 clips avoid the heavy crop landscape footage needs
+# CLIP rerank calibration: bonus = (cosine - BASELINE) * WEIGHT. ViT-B-32 puts a
+# clear match near 0.30 and an unrelated image near 0.15. Tune these two
+# knobs against pixabay_selection_debug.json ("clip_similarity") if picks drift.
+CLIP_MODEL = ("ViT-B-32", "laion2b_s34b_b79k")
+CLIP_RERANK_TOP_N = 40  # scenes collect 12-32 candidates, so this checks them all
+CLIP_SIMILARITY_BASELINE = 0.20
+CLIP_SIMILARITY_WEIGHT = 150.0
+CLIP_TOPIC_HANDICAP = 0.02  # prefer a scene match over an equally strong topic-only match
+# Thumbnails darker than this mean luma (0-255) are mostly-black clips.
+DARK_THUMBNAIL_LUMA = 45.0
+DARK_THUMBNAIL_PENALTY = 25.0
 VISUAL_ASSET_RETRY_ROUNDS = 2
 
 
@@ -671,6 +691,8 @@ class YouTube:
 
         pricing_entry = self._get_pricing_model_config("tts", provider, model)
         per_minute_rate = float(pricing_entry.get("per_minute_audio", 0.0) or 0.0)
+        per_1k_chars_rate = float(pricing_entry.get("per_1k_characters", 0.0) or 0.0)
+        characters = int(payload.get("characters", 0) or 0)
 
         self._record_cost_item(
             category="tts",
@@ -678,7 +700,7 @@ class YouTube:
             model=model,
             item_type="speech_generation",
             label="Voiceover",
-            estimated_cost=audio_minutes * per_minute_rate,
+            estimated_cost=audio_minutes * per_minute_rate + characters / 1000 * per_1k_chars_rate,
             quantity=audio_minutes,
             unit="audio_minutes",
             details={
@@ -1190,6 +1212,10 @@ class YouTube:
             "- Get straight to the point; never open with filler like 'welcome to this video'.\n"
             "- No markdown, no formatting, and never use a title.\n"
             "- Do not include 'voiceover', 'narrator', or any speaker labels.\n"
+            "- Write ONLY the words the narrator speaks aloud. Never describe the visuals or a scene "
+            "(no lines like 'صورة المشهد:', 'في المشهد:', 'Scene:'); any visual rules in the channel "
+            "context apply to the images, not to this script.\n"
+            "- Never prefix a sentence with a section label (no 'Hook:', 'مفاجأة ذكية:', 'النهاية:').\n"
             "- Never mention this prompt, the script itself, or the number of sentences/paragraphs.\n"
             "- Write in the language and dialect given in the request.\n"
             "- Return only the raw script text."
@@ -1231,6 +1257,7 @@ class YouTube:
             # Last resort after exhausting retries: truncate rather than loop.
             completion = completion[:5000].rstrip()
 
+        completion = self._strip_script_directions(completion) or completion
         self.script = completion
         self.scene_units = []
         self._combined_meta_prompts = None
@@ -1242,6 +1269,26 @@ class YouTube:
         self._write_workspace_state()
 
         return completion
+
+    def _strip_script_directions(self, script: str) -> str:
+        """
+        Removes stage directions and section labels the LLM sometimes writes
+        into narration, which TTS would otherwise read aloud.
+
+        Args:
+            script (str): generated script
+
+        Returns:
+            script (str): narration-only script
+        """
+        kept_lines = []
+        for line in str(script or "").splitlines():
+            if SCRIPT_DIRECTION_LINE.match(line):
+                continue
+            line = SCRIPT_LABEL_PREFIX.sub("", line, count=1).strip()
+            if line:
+                kept_lines.append(line)
+        return "\n".join(kept_lines)
 
     def _derive_subject_from_script(self, script: str) -> str:
         """
@@ -2272,9 +2319,44 @@ class YouTube:
             return {}
 
     def _save_pixabay_cache(self, payload: dict) -> None:
+        # Drop expired entries so the file (read on every search) stays small.
+        now_ts = int(time.time())
+        payload = {
+            key: entry
+            for key, entry in payload.items()
+            if now_ts - int(entry.get("cached_at", 0)) < STOCK_CACHE_TTL_SECONDS
+        }
         cache_path = self._get_pixabay_cache_path()
         with open(cache_path, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2, ensure_ascii=False)
+            json.dump(payload, file, ensure_ascii=False)
+
+    def _cached_stock_search(self, endpoint: str, params: dict, fetch_hits) -> list[dict]:
+        """
+        Runs one stock-media search through the shared 24h cache, which both
+        Pixabay and Pexels ask API clients to use.
+
+        Args:
+            endpoint (str): cache namespace, e.g. "api/videos" or "pexels/videos"
+            params (dict): query params that identify the search
+            fetch_hits (callable): performs the live request and returns hits
+
+        Returns:
+            hits (list[dict]): result hits
+        """
+        normalized_params = {key: params[key] for key in sorted(params)}
+        cache_key = hashlib.sha256(
+            json.dumps({"endpoint": endpoint, "params": normalized_params}, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        cache = self._load_pixabay_cache()
+        cached_entry = cache.get(cache_key)
+        now_ts = int(time.time())
+        if cached_entry and now_ts - int(cached_entry.get("cached_at", 0)) < STOCK_CACHE_TTL_SECONDS:
+            return cached_entry.get("hits", [])
+
+        hits = fetch_hits()
+        cache[cache_key] = {"cached_at": now_ts, "hits": hits}
+        self._save_pixabay_cache(cache)
+        return hits
 
     def _search_pixabay(self, endpoint: str, params: dict) -> list[dict]:
         """
@@ -2291,89 +2373,113 @@ class YouTube:
         if not api_key:
             return []
 
-        normalized_params = {key: params[key] for key in sorted(params)}
-        cache_key = hashlib.sha256(
-            json.dumps({"endpoint": endpoint, "params": normalized_params}, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        cache = self._load_pixabay_cache()
-        cached_entry = cache.get(cache_key)
-        now_ts = int(time.time())
-        if cached_entry and now_ts - int(cached_entry.get("cached_at", 0)) < 86400:
-            return cached_entry.get("hits", [])
+        def fetch_hits() -> list[dict]:
+            # (connect, read) timeouts: fail fast on a stalled request instead of
+            # blocking the whole asset step for up to a minute per search.
+            response = requests.get(
+                f"https://pixabay.com/{endpoint}/",
+                params={"key": api_key, **params},
+                timeout=(8, 20),
+            )
+            response.raise_for_status()
+            return response.json().get("hits", [])
 
-        # (connect, read) timeouts: fail fast on a stalled request instead of
-        # blocking the whole asset step for up to a minute per search.
-        response = requests.get(
-            f"https://pixabay.com/{endpoint}/",
-            params={"key": api_key, **params},
-            timeout=(8, 20),
-        )
-        response.raise_for_status()
-        body = response.json()
-        hits = body.get("hits", [])
-        cache[cache_key] = {"cached_at": now_ts, "hits": hits}
-        self._save_pixabay_cache(cache)
-        return hits
+        return self._cached_stock_search(endpoint, params, fetch_hits)
 
-    def _derive_stock_queries(self) -> list[str]:
+    def _search_pexels(self, asset_type: str, query: str, per_page: int) -> list[dict]:
         """
-        Builds simple Pixabay-friendly search queries from the current subject,
-        tags, and generated prompts.
+        Searches Pexels for portrait media and reshapes each result like a
+        Pixabay hit, so the shared scoring and selection code ranks both.
+
+        Args:
+            asset_type (str): "video" or "image"
+            query (str): search words
+            per_page (int): results to request
 
         Returns:
-            queries (list[str]): stock search queries
+            hits (list[dict]): Pixabay-shaped hits tagged with source "Pexels"
         """
-        try:
-            prompt = f"""
-            Generate a JSON array of short English stock-media search queries for Pixabay.
-            Return exactly 5 search queries, each between 2 and 6 words.
+        api_key = get_pexels_api_key()
+        if not api_key or getattr(self, "_pexels_rate_limited", False):
+            return []
 
-            Subject: {self.subject}
-            Script: {self.script}
-            Tags: {", ".join(self.metadata.get("tags", []))}
+        endpoint = "videos/search" if asset_type == "video" else "v1/search"
+        params = {"query": query, "orientation": "portrait", "per_page": per_page}
 
-            Rules:
-            - English only
-            - Search-friendly keywords, not full sentences
-            - Focus on visual subjects, places, moods, or objects that could match this story
-            - Return only a JSON array of strings
-            """
-            completion = (
-                str(self.generate_response(prompt, model_name=self._get_metadata_model_name()))
-                .replace("```json", "")
-                .replace("```", "")
-                .strip()
+        def fetch_hits() -> list[dict]:
+            response = requests.get(
+                f"https://api.pexels.com/{endpoint}",
+                params=params,
+                headers={"Authorization": api_key},
+                timeout=(8, 20),
             )
-            parsed = json.loads(completion)
-            ai_queries = [
-                re.sub(r"\s+", " ", str(item).strip())[:100]
-                for item in parsed
-                if str(item).strip()
-            ]
-            if ai_queries:
-                return ai_queries[:5]
-        except Exception:
-            pass
+            if response.status_code == 429:
+                # Free tier is 200 requests/hour; stop asking for the rest of this run.
+                self._pexels_rate_limited = True
+                warning("Pexels rate limit reached; using Pixabay only for the rest of this run.")
+                return []
+            response.raise_for_status()
+            body = response.json()
+            if asset_type == "video":
+                hits = [self._pexels_video_to_hit(item) for item in body.get("videos", [])]
+            else:
+                hits = [self._pexels_photo_to_hit(item) for item in body.get("photos", [])]
+            return [hit for hit in hits if hit]
 
-        queries = []
+        return self._cached_stock_search(f"pexels/{endpoint}", params, fetch_hits)
 
-        def add_query(value: str) -> None:
-            cleaned = re.sub(r"\s+", " ", str(value or "").strip())
-            cleaned = cleaned[:100].strip()
-            if cleaned and cleaned not in queries:
-                queries.append(cleaned)
+    def _pexels_slug_tags(self, page_url: str) -> str:
+        # Pexels has no tags field; its page slug describes the clip,
+        # e.g. .../video/man-reading-newspaper-3571264/ -> "man, reading, newspaper".
+        slug = str(page_url or "").rstrip("/").rsplit("/", 1)[-1]
+        slug = re.sub(r"-?\d+$", "", slug)
+        return ", ".join(word for word in slug.split("-") if word)
 
-        add_query(self.subject)
-        for tag in self.metadata.get("tags", []):
-            add_query(tag)
-        for hashtag in self.metadata.get("hashtags", []):
-            add_query(str(hashtag).replace("#", " "))
-        for prompt in getattr(self, "image_prompts", [])[:6]:
-            simplified = re.sub(r"[^A-Za-z0-9\s]", " ", prompt)
-            simplified = " ".join(simplified.split()[:8])
-            add_query(simplified)
+    def _pexels_video_to_hit(self, video: dict) -> dict | None:
+        files = [
+            item for item in video.get("video_files", []) or []
+            if item.get("link") and item.get("file_type") == "video/mp4" and item.get("width") and item.get("height")
+        ]
+        if not files:
+            return None
+        # Prefer portrait files closest to 720px wide, matching Pixabay's "medium" weight.
+        best = min(files, key=lambda item: (item["height"] < item["width"], abs(item["width"] - 720)))
+        return {
+            "id": f"pexels-{video.get('id')}",
+            "source": "Pexels",
+            "type": "film",
+            "tags": self._pexels_slug_tags(video.get("url", "")),
+            "duration": video.get("duration") or 0,
+            "user": (video.get("user") or {}).get("name", ""),
+            "views": 0,
+            "likes": 0,
+            "videos": {
+                "medium": {
+                    "url": best["link"],
+                    "width": best["width"],
+                    "height": best["height"],
+                    "thumbnail": video.get("image", ""),
+                }
+            },
+        }
 
-        return queries[: max(3, len(getattr(self, "image_prompts", [])[:6]))]
+    def _pexels_photo_to_hit(self, photo: dict) -> dict | None:
+        src = photo.get("src") or {}
+        if not src.get("large2x"):
+            return None
+        return {
+            "id": f"pexels-{photo.get('id')}",
+            "source": "Pexels",
+            "type": "photo",
+            "tags": str(photo.get("alt") or "") or self._pexels_slug_tags(photo.get("url", "")),
+            "imageWidth": photo.get("width") or 0,
+            "imageHeight": photo.get("height") or 0,
+            "user": photo.get("photographer", ""),
+            "views": 0,
+            "likes": 0,
+            "largeImageURL": src["large2x"],
+            "webformatURL": src.get("medium", ""),
+        }
 
     def _derive_stock_query_from_scene(self, scene_text: str, prompt_text: str) -> str:
         """
@@ -2509,6 +2615,7 @@ class YouTube:
         """
         fallback_queries: dict[int, dict] = {}
         cleaned_scene_payload = []
+        self._stock_topic_query = ""
         for index, scene_text in enumerate(scene_units):
             cleaned_prompt = self._strip_pixabay_query_boilerplate(
                 prompt_texts[index] if index < len(prompt_texts) else ""
@@ -2554,20 +2661,23 @@ class YouTube:
             return fallback_queries
 
         instructions = (
-            "You generate Pixabay stock-footage search queries as JSON. "
-            "Return ONLY a JSON array with one object per scene, each with keys "
-            "scene_index, primary_q, fallback_q. "
-            "Pixabay matches every word with AND, so fewer words return far more "
-            "results. Make queries BROAD, not specific:\n"
-            "- primary_q: the single core visual subject in AT MOST 2 words "
-            "(e.g. 'old factory', 'empty street', 'crowded market').\n"
-            "- fallback_q: an even broader single word category (e.g. 'factory', "
-            "'street', 'market').\n"
+            "You generate stock-footage search queries as JSON. "
+            'Return ONLY a JSON object: {"topic": "...", "scenes": [...]} where scenes '
+            "has one object per scene with keys scene_index, primary_q, fallback_q.\n"
+            "Stock sites match every word with AND and only know what a camera "
+            "filmed, so translate each idea into something physically visible:\n"
+            "- primary_q: 2-3 words, a concrete subject plus its action or place "
+            "(e.g. 'man looking mirror', 'woman waking bed', 'hands playing guitar').\n"
+            "- fallback_q: 1-2 words, the main filmable object of that scene "
+            "(e.g. 'mirror', 'guitar', 'therapist').\n"
+            "- topic: 1-3 words showing the whole video's subject on camera "
+            "(e.g. 'human brain', 'solar eclipse', 'traffic jam').\n"
+            "Never use abstract concepts (change, identity, conflict, balance, skill, "
+            "memory, compatibility, time) — show the person or object instead.\n"
             "Rules: English only; no '+' or punctuation, just words separated by "
             "spaces; never use cinematic/style words (vertical, photorealistic, "
-            "watermark, logo, text); never include locale boilerplate "
-            "(e.g. 'Egyptian setting', 'Arabic-speaking environment'); pick "
-            "concrete, common, photographable nouns — never sentences or actions."
+            "watermark, logo, text); never include nationality or locale words "
+            "(Egyptian, Cairo, Arab)."
         )
         prompt_body = (
             f"Video subject: {self._strip_pixabay_query_boilerplate(self.subject)}\n"
@@ -2598,6 +2708,12 @@ class YouTube:
                     )
 
                 parsed = self._parse_json_lenient(raw)
+                if isinstance(parsed, dict):
+                    self._stock_topic_query = self._format_pixabay_q_value(
+                        re.split(r"\s*\+\s*", str(parsed.get("topic", "") or "").strip()),
+                        max_words=3,
+                    )
+                    parsed = parsed.get("scenes")
                 applied_queries = 0
                 if isinstance(parsed, list):
                     for item in parsed:
@@ -2608,11 +2724,11 @@ class YouTube:
                             continue
                         primary_q = self._format_pixabay_q_value(
                             re.split(r"\s*\+\s*", str(item.get("primary_q", "") or "").strip()),
-                            max_words=2,
+                            max_words=3,
                         )
                         fallback_q = self._format_pixabay_q_value(
                             re.split(r"\s*\+\s*", str(item.get("fallback_q", "") or "").strip()),
-                            max_words=1,
+                            max_words=2,
                         )
                         if primary_q:
                             fallback_queries[scene_index]["primary_q"] = primary_q
@@ -2676,6 +2792,9 @@ class YouTube:
             "scene", "shot", "camera", "background", "style", "visual", "cinematic", "image",
             "still", "prompt", "photo", "video", "footage", "screen", "showing", "shows",
             "there", "their", "them", "they", "your", "our", "his", "her", "its", "very",
+            # Locale/meta words the LLM keeps adding ("Egyptian Street Narrator"); stock
+            # libraries rarely tag them, so under AND-matching they just zero out results.
+            "egyptian", "egypt", "cairo", "arab", "arabic", "arabian", "narrator", "without",
         }
 
         words = []
@@ -2725,6 +2844,9 @@ class YouTube:
                     if word not in topic_terms:
                         topic_terms.append(word)
 
+        # Non-English subjects/tags clean down to nothing, so lead with the
+        # English topic the stock-query planner returned.
+        add_terms(str(getattr(self, "_stock_topic_query", "") or "").replace("+", " "), max_words=3)
         add_terms(self.subject, max_words=5)
         for tag in self.metadata.get("tags", [])[:4]:
             add_terms(tag, max_words=3)
@@ -2932,8 +3054,9 @@ class YouTube:
         Returns:
             intents_and_context (tuple[list[dict], dict]): normalized scene intents and global context
         """
-        global_context = self._get_stock_global_context()
+        # Queries first: the planner also returns the English topic the global context uses.
         ai_pixabay_queries = self._generate_pixabay_search_queries(scene_units, prompt_texts)
+        global_context = self._get_stock_global_context()
         fallback_intents = [
             self._build_fallback_scene_stock_intent(
                 scene_index=index,
@@ -3169,6 +3292,10 @@ class YouTube:
             "party dress",
             "club dress",
             "night club",
+            # Not unsafe, just unusable next to real footage.
+            "green screen",
+            "blue screen",
+            "chroma key",
         }
         unsafe_tokens = {
             "nudity",
@@ -3202,6 +3329,15 @@ class YouTube:
             "vaping",
             "hookah",
             "shisha",
+            "greenscreen",
+            "chromakey",
+            "chroma",
+            "animation",
+            "animated",
+            "cartoon",
+            "illustration",
+            "clipart",
+            "vector",
         }
 
         searchable_text = " ".join(
@@ -3353,8 +3489,16 @@ class YouTube:
         avoid_penalty = must_avoid_overlap * 8.0
         score = baseline_score + variant_bonus + asset_type_bonus + structured_match_score - generic_penalty - avoid_penalty
 
+        if asset_type == "video":
+            video_files = hit.get("videos") or {}
+            thumbnail_url = (video_files.get("tiny") or video_files.get("medium") or {}).get("thumbnail", "")
+        else:
+            thumbnail_url = hit.get("webformatURL") or hit.get("previewURL") or ""
+
         return {
             "candidate_key": f"{asset_type}:{hit.get('id') or asset_url}",
+            "source": hit.get("source", "Pixabay"),
+            "thumbnail_url": thumbnail_url,
             "asset_type": asset_type,
             "asset_url": asset_url,
             "asset_variant": asset_variant,
@@ -3413,93 +3557,71 @@ class YouTube:
         query_variants = list(scene_intent.get("query_variants", []) or [])
         if max_query_variants and len(query_variants) > max_query_variants:
             query_variants = query_variants[:max_query_variants]
+        # The video's topic (e.g. "human brain") is the last resort for scenes whose
+        # own queries find nothing strong; the early break below skips it otherwise.
+        topic_query = str(getattr(self, "_stock_topic_query", "") or "").strip()
+        searched = {str(variant.get("query", "")).replace("+", " ").lower() for variant in query_variants}
+        if topic_query and topic_query.replace("+", " ").lower() not in searched:
+            query_variants.append({"type": "global_topic", "query": topic_query})
+
+        def merge_hits(search, asset_type: str, source_label: str, query_variant: dict, query: str) -> None:
+            try:
+                hits = search()
+            except Exception as exc:
+                if get_verbose():
+                    warning(f'{source_label} {asset_type} lookup failed for "{query}": {exc}')
+                return
+
+            for hit in hits:
+                candidate = self._build_pixabay_candidate(
+                    hit,
+                    asset_type=asset_type,
+                    query_variant=query_variant,
+                    scene_intent=scene_intent,
+                    preferred_duration=preferred_duration,
+                )
+                if candidate is None:
+                    continue
+                existing = candidates_by_key.get(candidate["candidate_key"])
+                if existing is None:
+                    candidates_by_key[candidate["candidate_key"]] = candidate
+                    continue
+                if candidate["best_query"] not in existing["matched_queries"]:
+                    existing["matched_queries"].append(candidate["best_query"])
+                if candidate["best_query_type"] not in existing["matched_query_types"]:
+                    existing["matched_query_types"].append(candidate["best_query_type"])
+                if candidate["base_score"] > existing["base_score"]:
+                    existing.update(
+                        {
+                            "best_query": candidate["best_query"],
+                            "best_query_type": candidate["best_query_type"],
+                            "base_score": candidate["base_score"],
+                            "score_breakdown": candidate["score_breakdown"],
+                            "duration": candidate["duration"],
+                            "views": candidate["views"],
+                            "likes": candidate["likes"],
+                        }
+                    )
 
         for variant_index, query_variant in enumerate(query_variants):
             query = str(query_variant.get("query", "")).strip()
             if not query:
                 continue
 
+            words = query.replace("+", " ")
             params = {
-                "q": query.replace("+", " "),
+                "q": words,
                 "safesearch": "true",
                 "per_page": per_page,
             }
+            image_params = {**params, "image_type": "photo", "orientation": "vertical"}
+            # "film" excludes Pixabay's animations/cartoons, which clash with real footage.
+            video_params = {**params, "video_type": "film"}
 
-            try:
-                for hit in self._search_pixabay("api/videos", params):
-                    candidate = self._build_pixabay_candidate(
-                        hit,
-                        asset_type="video",
-                        query_variant=query_variant,
-                        scene_intent=scene_intent,
-                        preferred_duration=preferred_duration,
-                    )
-                    if candidate is None:
-                        continue
-                    existing = candidates_by_key.get(candidate["candidate_key"])
-                    if existing is None:
-                        candidates_by_key[candidate["candidate_key"]] = candidate
-                    else:
-                        if candidate["best_query"] not in existing["matched_queries"]:
-                            existing["matched_queries"].append(candidate["best_query"])
-                        if candidate["best_query_type"] not in existing["matched_query_types"]:
-                            existing["matched_query_types"].append(candidate["best_query_type"])
-                        if candidate["base_score"] > existing["base_score"]:
-                            existing.update(
-                                {
-                                    "best_query": candidate["best_query"],
-                                    "best_query_type": candidate["best_query_type"],
-                                    "base_score": candidate["base_score"],
-                                    "score_breakdown": candidate["score_breakdown"],
-                                    "duration": candidate["duration"],
-                                    "views": candidate["views"],
-                                    "likes": candidate["likes"],
-                                }
-                            )
-            except Exception as exc:
-                if get_verbose():
-                    warning(f'Pixabay video lookup failed for "{query}": {exc}')
-
-            try:
-                for hit in self._search_pixabay(
-                    "api",
-                    {
-                        **params,
-                        "image_type": "photo",
-                        "orientation": "vertical",
-                    },
-                ):
-                    candidate = self._build_pixabay_candidate(
-                        hit,
-                        asset_type="image",
-                        query_variant=query_variant,
-                        scene_intent=scene_intent,
-                        preferred_duration=preferred_duration,
-                    )
-                    if candidate is None:
-                        continue
-                    existing = candidates_by_key.get(candidate["candidate_key"])
-                    if existing is None:
-                        candidates_by_key[candidate["candidate_key"]] = candidate
-                    else:
-                        if candidate["best_query"] not in existing["matched_queries"]:
-                            existing["matched_queries"].append(candidate["best_query"])
-                        if candidate["best_query_type"] not in existing["matched_query_types"]:
-                            existing["matched_query_types"].append(candidate["best_query_type"])
-                        if candidate["base_score"] > existing["base_score"]:
-                            existing.update(
-                                {
-                                    "best_query": candidate["best_query"],
-                                    "best_query_type": candidate["best_query_type"],
-                                    "base_score": candidate["base_score"],
-                                    "score_breakdown": candidate["score_breakdown"],
-                                    "views": candidate["views"],
-                                    "likes": candidate["likes"],
-                                }
-                            )
-            except Exception as exc:
-                if get_verbose():
-                    warning(f'Pixabay image lookup failed for "{query}": {exc}')
+            merge_hits(lambda: self._search_pixabay("api/videos", video_params), "video", "Pixabay", query_variant, query)
+            merge_hits(lambda: self._search_pixabay("api", image_params), "image", "Pixabay", query_variant, query)
+            merge_hits(lambda: self._search_pexels("video", words, per_page), "video", "Pexels", query_variant, query)
+            merge_hits(lambda: self._search_pexels("image", words, per_page), "image", "Pexels", query_variant, query)
 
             ranked_candidates = sorted(
                 candidates_by_key.values(),
@@ -3523,6 +3645,8 @@ class YouTube:
                 if best_score >= 78.0 or (variant_index == 0 and strong_candidate_count >= 2):
                     break
 
+        self._apply_clip_rerank(list(candidates_by_key.values()), scene_intent)
+
         return sorted(
             candidates_by_key.values(),
             key=lambda item: (
@@ -3533,6 +3657,115 @@ class YouTube:
             ),
             reverse=True,
         )
+
+    def _get_clip_model(self):
+        """
+        Lazily loads the CLIP model shared by every YouTube instance. Returns
+        None when open_clip is not installed, which disables reranking.
+        """
+        cached = getattr(YouTube, "_clip_bundle", None)
+        if cached is not None:
+            return cached or None
+
+        try:
+            import open_clip
+            import torch
+
+            model, _, preprocess = open_clip.create_model_and_transforms(CLIP_MODEL[0], pretrained=CLIP_MODEL[1])
+            model.eval()
+            YouTube._clip_bundle = (model, preprocess, open_clip.get_tokenizer(CLIP_MODEL[0]), torch)
+        except Exception as exc:
+            warning(f"CLIP rerank disabled (pip install open_clip_torch to enable): {exc}")
+            YouTube._clip_bundle = False
+        return YouTube._clip_bundle or None
+
+    def _apply_clip_rerank(self, candidates: list[dict], scene_intent: dict) -> None:
+        """
+        Adds a visual-match bonus to the top candidates by comparing their
+        thumbnails with the scene description. Tag overlap alone misjudges
+        clips because stock sites only attach 3-6 tags each.
+
+        Args:
+            candidates (list[dict]): scene candidates, updated in place
+            scene_intent (dict): normalized scene intent (English fields)
+        """
+        scene_description = " ".join(
+            str(scene_intent.get(key, "") or "").strip()
+            for key in ("subject", "action", "setting", "time", "mood")
+        ).strip()
+        if not scene_description:
+            variants = scene_intent.get("query_variants") or [{}]
+            scene_description = str(variants[0].get("query", "")).replace("+", " ")
+        # Every candidate is checked: an unchecked clip would keep its tag score
+        # and beat checked ones that took a mismatch penalty.
+        top = sorted(candidates, key=lambda item: float(item.get("base_score", 0.0)), reverse=True)
+        top = top[:CLIP_RERANK_TOP_N]
+        if not scene_description or not top:
+            return
+
+        bundle = self._get_clip_model()
+        if bundle is None:
+            return
+        model, preprocess, tokenizer, torch = bundle
+        from PIL import ImageStat
+
+        def load_thumbnail(url: str):
+            try:
+                return Image.open(io.BytesIO(self._download_url_bytes(url))).convert("RGB")
+            except Exception:
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            thumbnails = list(pool.map(load_thumbnail, [item.get("thumbnail_url") or "" for item in top]))
+        scored = [(item, image) for item, image in zip(top, thumbnails) if image is not None]
+        if not scored:
+            return
+
+        # A clip matches if it shows the scene OR the video's overall topic
+        # (e.g. a brain shot suits any scene of a brain-swap video).
+        texts = [f"a photo of {scene_description}"]
+        topic = str(getattr(self, "_stock_topic_query", "") or "").replace("+", " ").strip()
+        if topic:
+            texts.append(f"a photo of {topic}")
+        with torch.no_grad():
+            image_features = model.encode_image(torch.stack([preprocess(image) for _, image in scored]))
+            text_features = model.encode_text(tokenizer(texts))
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            similarity_rows = (image_features @ text_features.T).tolist()
+
+        bonuses = []
+        for (item, image), row in zip(scored, similarity_rows):
+            scene_similarity = row[0]
+            topic_similarity = row[1] if len(row) > 1 else 0.0
+            similarity = max(scene_similarity, topic_similarity - CLIP_TOPIC_HANDICAP)
+            brightness = ImageStat.Stat(image.convert("L")).mean[0]
+            dark_penalty = DARK_THUMBNAIL_PENALTY if brightness < DARK_THUMBNAIL_LUMA else 0.0
+            bonus = (similarity - CLIP_SIMILARITY_BASELINE) * CLIP_SIMILARITY_WEIGHT - dark_penalty
+            bonuses.append(bonus)
+            item["base_score"] = float(item.get("base_score", 0.0)) + bonus
+            item["selection_score"] = float(max(0.0, min(100.0, item["base_score"])))
+            item.setdefault("score_breakdown", {}).update(
+                {
+                    "clip_similarity": round(scene_similarity, 4),
+                    "clip_topic_similarity": round(topic_similarity, 4),
+                    "clip_bonus": round(bonus, 3),
+                    "brightness": round(brightness, 1),
+                    "dark_penalty": dark_penalty,
+                }
+            )
+
+        # Candidates CLIP could not see (no/failed thumbnail, or beyond TOP_N) get
+        # the worst observed bonus, so being unchecked is never an advantage.
+        scored_ids = {id(item) for item, _ in scored}
+        worst_bonus = min(bonuses)
+        for item in candidates:
+            if id(item) not in scored_ids:
+                item["base_score"] = float(item.get("base_score", 0.0)) + worst_bonus
+                item["selection_score"] = float(max(0.0, min(100.0, item["base_score"])))
+                item.setdefault("score_breakdown", {})["clip_bonus"] = round(worst_bonus, 3)
 
     def _calculate_pixabay_diversity_penalty(self, candidate: dict, selected_candidates: list[dict]) -> tuple[float, dict]:
         """
@@ -3651,6 +3884,7 @@ class YouTube:
         """
         return {
             "selected": selected,
+            "source": candidate.get("source", "Pixabay"),
             "asset_type": candidate.get("asset_type"),
             "asset_id": candidate.get("hit_id"),
             "asset_url": candidate.get("asset_url"),
@@ -3752,12 +3986,18 @@ class YouTube:
 
         selected_by_scene = self._select_pixabay_candidates_across_scenes(scene_plans)
         debug_scenes = []
+        # With no AI fallback, a weaker stock clip beats repeating the previous scene's clip.
+        accept_below_threshold = get_asset_strategy() == "pixabay_only"
 
         for plan in scene_plans:
             scene_index = plan["scene_index"]
             local_scene_index = plan["local_scene_index"]
             selected_candidate = selected_by_scene.get(local_scene_index)
-            approved_candidate = selected_candidate if self._pixabay_candidate_meets_quality_threshold(selected_candidate) else None
+            approved_candidate = (
+                selected_candidate
+                if accept_below_threshold or self._pixabay_candidate_meets_quality_threshold(selected_candidate)
+                else None
+            )
             selected_summary = None
             local_asset_path = None
             fallback_reason = ""
@@ -3784,14 +4024,15 @@ class YouTube:
                         else:
                             filename = f"stock_image_{len(self.visual_assets)+1:02d}_{approved_candidate.get('hit_id') or 'pixabay'}.jpg"
 
+                        source_label = approved_candidate.get("source", "Pixabay")
                         path = self._persist_binary_asset(
                             asset_bytes,
                             filename,
-                            "Pixabay",
+                            source_label,
                             approved_candidate["asset_type"],
                             scene_index=scene_index,
                         )
-                        self._record_stock_asset_cost("pixabay", approved_candidate["asset_type"], scene_index=scene_index)
+                        self._record_stock_asset_cost(source_label.lower(), approved_candidate["asset_type"], scene_index=scene_index)
                         local_asset_path = path
                         if self.visual_assets and self.visual_assets[-1].get("path") == path:
                             self.visual_assets[-1].update(
@@ -3807,7 +4048,7 @@ class YouTube:
                             assets_by_scene[scene_index] = {
                                 "type": approved_candidate["asset_type"],
                                 "path": path,
-                                "source": "Pixabay",
+                                "source": source_label,
                                 "scene_index": scene_index,
                             }
                         selected_summary = self._summarize_pixabay_candidate_for_debug(approved_candidate, selected=True)
@@ -3924,8 +4165,17 @@ class YouTube:
         quality_bonus = 3.0 if not hit.get("isLowQuality", False) else -4.0
         ai_penalty = -3.0 if hit.get("isAiGenerated", False) else 0.0
         film_bonus = 2.0 if str(hit.get("type", "")).lower() == "film" else 0.0
+        first_file = next(iter((hit.get("videos") or {}).values()), {}) or {}
+        portrait_bonus = (
+            PORTRAIT_VIDEO_BONUS
+            if (first_file.get("height") or 0) > (first_file.get("width") or 0)
+            else 0.0
+        )
 
-        return overlap * 10.0 + duration_score + views_score + likes_score + quality_bonus + ai_penalty + film_bonus
+        return (
+            overlap * 10.0 + duration_score + views_score + likes_score
+            + quality_bonus + ai_penalty + film_bonus + portrait_bonus
+        )
 
     def _is_pixabay_video_duration_usable(self, hit: dict, preferred_duration: float | None) -> bool:
         """
@@ -3991,89 +4241,6 @@ class YouTube:
             if url:
                 return url, key
         return None, ""
-
-    def _fetch_pixabay_stock_asset(
-        self,
-        query: str,
-        used_urls: set[str],
-        scene_index: int | None = None,
-        preferred_duration: float | None = None,
-    ) -> dict | None:
-        """
-        Fetches one Pixabay stock asset, preferring video then falling back to image.
-
-        Args:
-            query (str): search query
-            used_urls (set[str]): URLs already used in this run
-            scene_index (int | None): aligned scene index
-            preferred_duration (float | None): target scene duration
-
-        Returns:
-            asset (dict | None): asset descriptor
-        """
-        params = {
-            "q": query,
-            "safesearch": "true",
-            "editors_choice": "true",
-            "per_page": get_pixabay_results_per_query(),
-        }
-
-        try:
-            video_hits = self._search_pixabay("api/videos", params)
-            ranked_video_hits = sorted(
-                video_hits,
-                key=lambda hit: self._score_pixabay_video_hit(hit, query, preferred_duration),
-                reverse=True,
-            )
-            for hit in ranked_video_hits:
-                if not self._is_pixabay_video_duration_usable(hit, preferred_duration):
-                    continue
-                video_url, variant = self._choose_pixabay_video_url(hit)
-                if not video_url or video_url in used_urls:
-                    continue
-                used_urls.add(video_url)
-                video_bytes = self._download_url_bytes(video_url)
-                if not video_bytes:
-                    continue
-                filename = f"stock_video_{len(self.visual_assets)+1:02d}_{variant}.mp4"
-                path = self._persist_binary_asset(video_bytes, filename, "Pixabay", "video", scene_index=scene_index)
-                self._record_stock_asset_cost("pixabay", "video", scene_index=scene_index)
-                return {"type": "video", "path": path}
-        except Exception as exc:
-            if get_verbose():
-                warning(f'Pixabay video lookup failed for "{query}": {exc}')
-
-        try:
-            image_hits = self._search_pixabay(
-                "api",
-                {
-                    **params,
-                    "image_type": "photo",
-                    "orientation": "vertical",
-                },
-            )
-            ranked_image_hits = sorted(
-                image_hits,
-                key=lambda hit: self._score_pixabay_image_hit(hit, query),
-                reverse=True,
-            )
-            for hit in ranked_image_hits:
-                image_url = hit.get("largeImageURL") or hit.get("webformatURL")
-                if not image_url or image_url in used_urls:
-                    continue
-                used_urls.add(image_url)
-                image_bytes = self._download_url_bytes(image_url)
-                if not image_bytes:
-                    continue
-                filename = f"stock_image_{len(self.visual_assets)+1:02d}.jpg"
-                path = self._persist_binary_asset(image_bytes, filename, "Pixabay", "image", scene_index=scene_index)
-                self._record_stock_asset_cost("pixabay", "image", scene_index=scene_index)
-                return {"type": "image", "path": path}
-        except Exception as exc:
-            if get_verbose():
-                warning(f'Pixabay image lookup failed for "{query}": {exc}')
-
-        return None
 
     def _generate_visual_assets(self) -> int:
         """
@@ -4294,7 +4461,7 @@ class YouTube:
 
                 # Pixabay clips occasionally decode fine as full files but render
                 # black after an in-memory seek. Normalize the trimmed window first.
-                if asset_source == "pixabay" and start_time > 0:
+                if asset_source in ("pixabay", "pexels") and start_time > 0:
                     clip.close()
                     normalized_asset_path = self._normalize_trimmed_pixabay_video(
                         asset_path,
@@ -5212,6 +5379,84 @@ class YouTube:
                     warning(f"Failed to generate image with OpenRouter: {str(e)}")
                 return None
 
+    def generate_image_qwen_local(self, prompt: str, scene_index: int | None = None) -> str:
+        """
+        Generates an AI image using a self-hosted Qwen-Image server
+        (see scripts/qwen_server.py). Costs nothing per image; the server may
+        be on this machine or on a rented GPU, set by qwen_api_base_url.
+
+        Args:
+            prompt (str): Prompt for image generation
+            scene_index (int | None): aligned scene index
+
+        Returns:
+            path (str): The path to the generated image.
+        """
+        print(f"Generating Image using local Qwen-Image server: {prompt}")
+
+        base_url = get_qwen_api_base_url()
+        if not base_url:
+            error("qwen_api_base_url is not configured.")
+            return None
+
+        width, height = get_qwen_dimensions(get_nanobanana2_aspect_ratio())
+        payload = {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "steps": get_qwen_steps(),
+        }
+
+        headers = {"Content-Type": "application/json"}
+        api_key = get_qwen_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        for attempt in range(1, IMAGE_RATE_LIMIT_RETRIES + 2):
+            try:
+                response = requests.post(
+                    f"{base_url}/generate",
+                    headers=headers,
+                    json=payload,
+                    timeout=get_qwen_request_timeout(),
+                )
+
+                # A single-GPU server serialises requests, so a busy signal is
+                # normal rather than a quota problem worth aborting the run for.
+                if _is_retryable_server_error(response) and attempt <= IMAGE_RATE_LIMIT_RETRIES:
+                    wait_seconds = IMAGE_RATE_LIMIT_BACKOFF_SECONDS * attempt
+                    warning(
+                        f"Qwen server unavailable ({response.status_code}). "
+                        f"Waiting {wait_seconds}s before retry {attempt}/{IMAGE_RATE_LIMIT_RETRIES}."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                response.raise_for_status()
+
+                content_type = response.headers.get("Content-Type", "")
+                if not content_type.startswith("image/"):
+                    if get_verbose():
+                        warning(
+                            f"Qwen server returned {content_type or 'no content type'} "
+                            f"instead of an image. Body: {response.text[:400]}"
+                        )
+                    return None
+
+                path = self._persist_image(response.content, "Qwen-Image (local)", scene_index=scene_index)
+                self._record_image_generation_cost(
+                    "qwen_local",
+                    "qwen-image",
+                    scene_index=scene_index,
+                )
+                return path
+            except Exception as e:
+                if get_verbose():
+                    warning(f"Failed to generate image with the Qwen server: {str(e)}")
+                return None
+
+        return None
+
     def generate_image(self, prompt: str, scene_index: int | None = None) -> str:
         """
         Generates an AI image based on the configured provider.
@@ -5229,6 +5474,9 @@ class YouTube:
 
         if provider == "openrouter":
             return self.generate_image_openrouter(prompt, scene_index=scene_index)
+
+        if provider == "qwen_local":
+            return self.generate_image_qwen_local(prompt, scene_index=scene_index)
 
         return self.generate_image_nanobanana2(prompt, scene_index=scene_index)
 
@@ -7528,6 +7776,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ],
             "candidates": [
                 {
+                    "source": candidate.get("source", "Pixabay"),
                     "asset_type": candidate.get("asset_type"),
                     "asset_url": candidate.get("asset_url"),
                     "asset_variant": candidate.get("asset_variant"),
@@ -7585,14 +7834,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         else:
             filename = f"stock_image_{len(self.visual_assets)+1:02d}_{candidate_payload.get('hit_id') or 'pixabay'}.jpg"
 
+        source_label = str(candidate_payload.get("source") or "Pixabay")
         path = self._persist_binary_asset(
             asset_bytes,
             filename,
-            "Pixabay",
+            source_label,
             asset_type,
             scene_index=scene_index,
         )
-        self._record_stock_asset_cost("pixabay", asset_type, scene_index=scene_index)
+        self._record_stock_asset_cost(source_label.lower(), asset_type, scene_index=scene_index)
         asset_record = dict(self.visual_assets[-1])
         asset_record.update(
             {

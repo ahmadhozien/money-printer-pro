@@ -64,6 +64,13 @@ DEFAULT_PRICING_CONFIG = {
                 "default": {"per_image": 0.00}
             }
         },
+        "qwen_local": {
+            "models": {
+                # Self-hosted weights: no per-image charge. GPU rental, if any,
+                # is billed by the hour and tracked outside this pipeline.
+                "default": {"per_image": 0.00}
+            }
+        },
         "pixabay": {
             "models": {
                 "default": {"per_asset": 0.00}
@@ -80,6 +87,16 @@ DEFAULT_PRICING_CONFIG = {
         "kitten": {
             "models": {
                 "default": {"per_minute_audio": 0.00}
+            }
+        },
+        "edge": {
+            "models": {
+                "default": {"per_minute_audio": 0.00}
+            }
+        },
+        "deepgram": {
+            "models": {
+                "default": {"per_1k_characters": 0.030}
             }
         },
     },
@@ -303,6 +320,80 @@ def get_image_provider() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
         return json.load(file).get("image_provider", "nanobanana2").strip().lower() or "nanobanana2"
 
+# Qwen-Image's trained resolutions. Off-grid sizes degrade output noticeably,
+# so the provider snaps to these rather than passing arbitrary dimensions.
+QWEN_ASPECT_DIMENSIONS = {
+    "1:1": (1328, 1328),
+    "16:9": (1664, 928),
+    "9:16": (928, 1664),
+    "4:3": (1472, 1104),
+    "3:4": (1104, 1472),
+    "3:2": (1584, 1056),
+    "2:3": (1056, 1584),
+}
+
+def get_qwen_dimensions(aspect_ratio: str) -> tuple:
+    """
+    Maps an aspect ratio to Qwen-Image's nearest trained resolution.
+
+    Args:
+        aspect_ratio (str): ratio string such as "9:16"
+
+    Returns:
+        dimensions (tuple): (width, height) in pixels
+    """
+    return QWEN_ASPECT_DIMENSIONS.get(str(aspect_ratio).strip(), QWEN_ASPECT_DIMENSIONS["9:16"])
+
+def get_qwen_api_base_url() -> str:
+    """
+    Gets the base URL of the self-hosted Qwen-Image server. Point this at
+    127.0.0.1 for a local GPU or at a rented box while batch-rendering.
+
+    Returns:
+        url (str): base URL without a trailing slash
+    """
+    value = _read_config().get("qwen_api_base_url", "http://127.0.0.1:8189")
+    return str(value).strip().rstrip("/")
+
+def get_qwen_api_key() -> str:
+    """
+    Gets the shared token for the Qwen-Image server. Optional for loopback,
+    but required whenever the server is reachable off this machine.
+
+    Returns:
+        key (str): shared token, or "" when unset
+    """
+    configured = _read_config().get("qwen_api_key", "")
+    return str(configured or os.environ.get("QWEN_API_KEY", ""))
+
+def get_qwen_steps() -> int:
+    """
+    Gets the Qwen-Image sampling step count. This is the main quality/speed
+    dial: 50 matches the reference config, 20-25 renders roughly twice as
+    fast with a modest quality cost.
+
+    Returns:
+        steps (int): number of inference steps
+    """
+    try:
+        return max(1, int(_read_config().get("qwen_steps", 30)))
+    except (TypeError, ValueError):
+        return 30
+
+def get_qwen_request_timeout() -> int:
+    """
+    HTTP timeout (seconds) for Qwen-Image requests. A 20B model with CPU
+    offload can take many minutes per image, so this is deliberately far
+    higher than the hosted-API timeout.
+
+    Returns:
+        timeout (int): seconds to wait for one image
+    """
+    try:
+        return max(1, int(_read_config().get("qwen_request_timeout", 1800)))
+    except (TypeError, ValueError):
+        return 1800
+
 def get_openrouter_api_key() -> str:
     """
     Gets the OpenRouter API key.
@@ -442,6 +533,17 @@ def get_pixabay_api_key() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
         configured = json.load(file).get("pixabay_api_key", "")
         return configured or os.environ.get("PIXABAY_API_KEY", "")
+
+def get_pexels_api_key() -> str:
+    """
+    Gets the Pexels API key. Pexels is searched alongside Pixabay when set;
+    unlike Pixabay it can filter videos to portrait orientation.
+
+    Returns:
+        key (str): API key, or "" to skip Pexels
+    """
+    configured = _read_config().get("pexels_api_key", "")
+    return str(configured or os.environ.get("PEXELS_API_KEY", ""))
 
 def get_asset_strategy() -> str:
     """
@@ -600,6 +702,34 @@ def get_openai_tts_voice() -> str:
     """
     with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
         return json.load(file).get("openai_tts_voice", "coral")
+
+def get_edge_tts_voice() -> str:
+    """
+    Gets the Microsoft Edge neural voice used by the free `edge` TTS provider.
+
+    Returns:
+        voice (str): voice short name, e.g. ar-EG-ShakirNeural
+    """
+    return str(_read_config().get("edge_tts_voice", "ar-EG-ShakirNeural")).strip() or "ar-EG-ShakirNeural"
+
+def get_deepgram_api_key() -> str:
+    """
+    Gets the Deepgram API key used as an English-only TTS fallback.
+
+    Returns:
+        key (str): API key, or "" to skip Deepgram
+    """
+    configured = _read_config().get("deepgram_api_key", "")
+    return str(configured or os.environ.get("DEEPGRAM_API_KEY", ""))
+
+def get_deepgram_tts_model() -> str:
+    """
+    Gets the Deepgram Aura-2 voice model.
+
+    Returns:
+        model (str): model name, e.g. aura-2-thalia-en
+    """
+    return str(_read_config().get("deepgram_tts_model", "aura-2-thalia-en")).strip() or "aura-2-thalia-en"
 
 def get_youtube_metadata_model() -> str:
     """

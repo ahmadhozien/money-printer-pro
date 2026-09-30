@@ -15,7 +15,12 @@
   "openai_image_quality": "low",
   "openrouter_api_key": "",
   "openrouter_image_model": "black-forest-labs/flux.2-flex",
+  "qwen_api_base_url": "http://127.0.0.1:8189",
+  "qwen_api_key": "",
+  "qwen_steps": 30,
+  "qwen_request_timeout": 1800,
   "pixabay_api_key": "",
+  "pexels_api_key": "",
   "youtube_data_api_key": "",
   "trends_region": "US",
   "reddit_client_id": "",
@@ -54,6 +59,9 @@
   "tts_provider": "auto",
   "openai_tts_model": "gpt-4o-mini-tts",
   "openai_tts_voice": "onyx",
+  "edge_tts_voice": "ar-EG-ShakirNeural",
+  "deepgram_api_key": "",
+  "deepgram_tts_model": "aura-2-thalia-en",
   "subtitle_font": "bold_font.ttf",
   "subtitle_mode": "word_by_word",
   "subtitle_max_chunk_words": 5,
@@ -138,6 +146,13 @@
         "models": {
           "default": {
             "per_minute_audio": 0.0
+          }
+        }
+      },
+      "deepgram": {
+        "models": {
+          "default": {
+            "per_1k_characters": 0.03
           }
         }
       }

@@ -1265,7 +1265,7 @@ def render_youtube_scene_editor(
                 regen_provider = regen_col.selectbox(
                     "Regen with",
                     options=["Pixabay", "Nano Banana"],
-                    index=0 if str(scene.get("asset_source", "")).strip().lower() == "pixabay" else 1,
+                    index=0 if str(scene.get("asset_source", "")).strip().lower() in ("pixabay", "pexels") else 1,
                     key=f"{editor_key}_regen_provider_{index}",
                     label_visibility="collapsed",
                 )
@@ -1369,7 +1369,8 @@ def render_youtube_pixabay_picker_dialog(
             "Pick one fetched Pixabay asset",
             options=list(range(len(candidates))),
             format_func=lambda idx: (
-                f"Option {idx + 1} | {candidates[idx].get('asset_type', 'asset')} | "
+                f"Option {idx + 1} | {candidates[idx].get('source', 'Pixabay')} "
+                f"{candidates[idx].get('asset_type', 'asset')} | "
                 f"score {float(candidates[idx].get('selection_score', 0.0) or 0.0):.1f}"
             ),
             key=f"pixabay_picker_choice_{account['id']}_{scene_index}",
