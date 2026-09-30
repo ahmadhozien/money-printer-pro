@@ -66,6 +66,8 @@ IMAGE_RATE_LIMIT_RETRIES = 3
 IMAGE_RATE_LIMIT_BACKOFF_SECONDS = 5
 PIXBAY_MIN_SELECTION_SCORE = 65.0
 STOCK_CACHE_TTL_SECONDS = 86400
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=16))
 # Script lines that describe visuals ("صورة المشهد: ...", "Scene: ...") and
 # short "Label:" prefixes ("مفاجأة ذكية: ..."), both of which TTS would read aloud.
 SCRIPT_DIRECTION_LINE = re.compile(
@@ -2670,8 +2672,9 @@ class YouTube:
             "(e.g. 'man looking mirror', 'woman waking bed', 'hands playing guitar').\n"
             "- fallback_q: 1-2 words, the main filmable object of that scene "
             "(e.g. 'mirror', 'guitar', 'therapist').\n"
-            "- topic: 1-3 words showing the whole video's subject on camera "
-            "(e.g. 'human brain', 'solar eclipse', 'traffic jam').\n"
+            "- topic: 1-2 word ENGLISH NOUN for the main physical thing the whole video is about, "
+            "never a verb or event (e.g. 'human brain' not 'brain swap', 'sun' not "
+            "'sun disappearing', 'ocean' not 'oceans vanish').\n"
             "Never use abstract concepts (change, identity, conflict, balance, skill, "
             "memory, compatibility, time) — show the person or object instead.\n"
             "Rules: English only; no '+' or punctuation, just words separated by "
@@ -2711,7 +2714,7 @@ class YouTube:
                 if isinstance(parsed, dict):
                     self._stock_topic_query = self._format_pixabay_q_value(
                         re.split(r"\s*\+\s*", str(parsed.get("topic", "") or "").strip()),
-                        max_words=3,
+                        max_words=2,
                     )
                     parsed = parsed.get("scenes")
                 applied_queries = 0
@@ -2719,7 +2722,10 @@ class YouTube:
                     for item in parsed:
                         if not isinstance(item, dict):
                             continue
-                        scene_index = int(item.get("scene_index", -1) or -1)
+                        try:
+                            scene_index = int(item.get("scene_index", -1))
+                        except (TypeError, ValueError):
+                            continue
                         if scene_index not in fallback_queries:
                             continue
                         primary_q = self._format_pixabay_q_value(
@@ -2739,6 +2745,10 @@ class YouTube:
                             fallback_queries[scene_index]["fallback_q"] = fallback_q
 
                 if applied_queries > 0:
+                    if not self._stock_topic_query and 0 in fallback_queries:
+                        # ponytail: topic came back non-English/empty; the hook scene's main
+                        # object is usually the video's subject. Good enough as a last resort.
+                        self._stock_topic_query = fallback_queries[0].get("fallback_q", "")
                     return fallback_queries
 
                 last_error = "Stock-query planner returned no usable Pixabay q values."
@@ -3493,7 +3503,8 @@ class YouTube:
             video_files = hit.get("videos") or {}
             thumbnail_url = (video_files.get("tiny") or video_files.get("medium") or {}).get("thumbnail", "")
         else:
-            thumbnail_url = hit.get("webformatURL") or hit.get("previewURL") or ""
+            # CLIP downsizes to 224px, so the ~150px preview is enough and far lighter.
+            thumbnail_url = hit.get("previewURL") or hit.get("webformatURL") or ""
 
         return {
             "candidate_key": f"{asset_type}:{hit.get('id') or asset_url}",
@@ -3717,7 +3728,7 @@ class YouTube:
 
         from concurrent.futures import ThreadPoolExecutor
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=16) as pool:
             thumbnails = list(pool.map(load_thumbnail, [item.get("thumbnail_url") or "" for item in top]))
         scored = [(item, image) for item, image in zip(top, thumbnails) if image is not None]
         if not scored:
@@ -4229,7 +4240,8 @@ class YouTube:
         if not url:
             return None
         # (connect, read) timeouts so a stalled download can't freeze the run.
-        response = requests.get(url, timeout=(8, 45))
+        # Shared session reuses TLS connections: dozens of CDN thumbnails per scene.
+        response = HTTP_SESSION.get(url, timeout=(8, 45))
         response.raise_for_status()
         return response.content
 
