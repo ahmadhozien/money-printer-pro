@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import numpy as np
@@ -25,6 +26,11 @@ KITTEN_MODEL = "KittenML/kitten-tts-mini-0.8"
 KITTEN_SAMPLE_RATE = 24000
 DEEPGRAM_MAX_CHARS = 2000  # Deepgram /v1/speak rejects longer inputs
 
+
+def word_timings_path(audio_path: str) -> str:
+    """Sidecar JSON holding [{word, start, end}] for a synthesized voiceover."""
+    return f"{os.path.splitext(str(audio_path))[0]}.words.json"
+
 class TTS:
     def __init__(self) -> None:
         self._provider = get_tts_provider()
@@ -42,6 +48,9 @@ class TTS:
         text = self._prepare_text_for_tts(text)
         if not text:
             raise ValueError("Cannot synthesize empty text.")
+        # Only Edge produces word timings; drop any from an earlier voiceover in this workspace.
+        if os.path.exists(word_timings_path(output_file)):
+            os.remove(word_timings_path(output_file))
 
         # Paid providers only run when the free ones before them fail.
         # Deepgram Aura-2 has no Arabic voices, so it only backs up English.
@@ -81,11 +90,24 @@ class TTS:
         import edge_tts
 
         voice = get_edge_tts_voice()
-        mp3_path = f"{os.path.splitext(output_file)[0]}.edge.mp3"
-        asyncio.run(edge_tts.Communicate(text, voice).save(mp3_path))
-        audio, sample_rate = sf.read(mp3_path)
-        os.remove(mp3_path)
+        audio_chunks, words = [], []
+
+        async def collect() -> None:
+            communicate = edge_tts.Communicate(text, voice, boundary="WordBoundary")
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_chunks.append(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    # offset/duration are 100-nanosecond ticks
+                    start = chunk["offset"] / 1e7
+                    words.append({"word": chunk["text"], "start": start, "end": start + chunk["duration"] / 1e7})
+
+        asyncio.run(collect())
+        audio, sample_rate = sf.read(io.BytesIO(b"".join(audio_chunks)))
         sf.write(output_file, audio, sample_rate)
+        # Exact spoken-word timings for captions, scene cuts and SFX (replaces guessing/Whisper).
+        with open(word_timings_path(output_file), "w", encoding="utf-8") as file:
+            json.dump(words, file, ensure_ascii=False)
 
         if cost_callback:
             cost_callback(

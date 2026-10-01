@@ -16,6 +16,8 @@ All your configurations will be in a file in the root directory, called `config.
 - `image_provider`: `string` - Image generation provider. Supported values: `nanobanana2`, `openai`, `openrouter`, `qwen_local`.
 - `asset_strategy`: `string` - Visual sourcing strategy for videos. Supported values: `mixed`, `pixabay_only`, `ai_only`. `mixed` uses Pixabay stock first and only falls back to a limited number of AI-generated visuals. `pixabay_only` always uses the best stock clip found for each scene, even when it scores below the AI-fallback threshold, so clips are not repeated across scenes.
 - `max_ai_assets`: `number` - Maximum number of AI-generated visuals allowed per video when `asset_strategy` is `mixed` (default: `2`).
+- `youtube_script_model`: `string` - Optional model used only for writing narration scripts (e.g. `gpt-5`), while topics, metadata and stock queries stay on the main model. Empty uses the main model.
+- Per-channel overrides: a YouTube account record in `.mp/youtube.json` may set `script_model`, `asset_strategy` and `max_ai_assets`; they take precedence over the global values for that channel only. In `mixed` mode the AI budget goes to the scenes with the weakest stock matches, and scenes left after the budget is spent use their best stock clip instead of repeating the previous scene.
 - `openai_image_model`: `string` - OpenAI image model used when `image_provider` is `openai` (default example: `gpt-image-1`).
 - `openai_image_quality`: `string` - OpenAI image quality setting (`low`, `medium`, or `high`).
 - `openrouter_api_key`: `string` - OpenRouter API key. If empty, MPV2 falls back to the `OPENROUTER_API_KEY` environment variable.

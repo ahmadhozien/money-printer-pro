@@ -25,7 +25,7 @@ except Exception:
 
 from utils import *
 from cache import *
-from .Tts import TTS
+from .Tts import TTS, word_timings_path
 from llm_provider import generate_text, generate_text_result
 from config import *
 from status import *
@@ -191,10 +191,17 @@ class YouTube:
         self._is_for_kids: bool = get_is_for_kids() if is_for_kids is None else bool(is_for_kids)
         self.browser: webdriver.Firefox | None = None
         self._workspace_dir: str | None = None
+        # Optional per-channel overrides stored on the account record
+        # (script_model, asset_strategy, max_ai_assets); config.json is the fallback.
+        self._account_settings: dict = next(
+            (account for account in get_accounts("youtube") if account.get("id") == account_uuid),
+            {},
+        )
 
         self.images = []
         self.visual_assets = []
         self.scene_units = []
+        self._stock_backups: dict[int, dict] = {}
         self._combined_meta_prompts = None
         self._cost_items = []
         self._cost_notes = []
@@ -1019,6 +1026,26 @@ class YouTube:
         """
         return os.path.join(self._get_workspace_dir(), filename)
 
+    def _get_asset_strategy(self) -> str:
+        """Channel's asset_strategy override, else the global config value."""
+        value = str(self._account_settings.get("asset_strategy") or "").strip().lower()
+        return value if value in ("mixed", "pixabay_only", "ai_only") else get_asset_strategy()
+
+    def _get_max_ai_assets(self) -> int:
+        """Channel's max_ai_assets override, else the global config value."""
+        try:
+            return max(0, int(self._account_settings["max_ai_assets"]))
+        except (KeyError, TypeError, ValueError):
+            return get_max_ai_assets()
+
+    def _get_script_model_name(self) -> str | None:
+        """Channel's script_model override, else youtube_script_model, else the active model."""
+        return (
+            str(self._account_settings.get("script_model") or "").strip()
+            or get_youtube_script_model()
+            or None
+        )
+
     def _get_metadata_model_name(self) -> str | None:
         """
         Returns a cheaper model override for metadata generation when available.
@@ -1137,7 +1164,10 @@ class YouTube:
         if target_duration <= 0:
             return ""
 
-        approx_word_budget = max(20, int(round(target_duration * 2.4)))
+        # Measured spoken pace: Arabic narration runs ~1.8 words/s (191 words took
+        # 107 s with Edge); English TTS ~2.4. Tune if a new voice runs faster/slower.
+        words_per_second = 1.8 if "arabic" in str(self.language or "").lower() else 2.4
+        approx_word_budget = max(20, int(round(target_duration * words_per_second)))
         return (
             f"Target spoken runtime: about {target_duration} seconds.\n"
             f"Aim for roughly {approx_word_budget} words total when read aloud naturally.\n"
@@ -1236,6 +1266,7 @@ class YouTube:
                 "",
                 self.generate_response(
                     prompt,
+                    model_name=self._get_script_model_name(),
                     instructions=instructions,
                     **self._llm_options("script"),
                 )
@@ -3998,7 +4029,7 @@ class YouTube:
         selected_by_scene = self._select_pixabay_candidates_across_scenes(scene_plans)
         debug_scenes = []
         # With no AI fallback, a weaker stock clip beats repeating the previous scene's clip.
-        accept_below_threshold = get_asset_strategy() == "pixabay_only"
+        accept_below_threshold = self._get_asset_strategy() == "pixabay_only"
 
         for plan in scene_plans:
             scene_index = plan["scene_index"]
@@ -4021,47 +4052,15 @@ class YouTube:
                 selected_summary = self._summarize_pixabay_candidate_for_debug(selected_candidate, selected=False)
                 selected_summary["rejected_for_ai_fallback"] = True
                 selected_summary["rejection_reason"] = fallback_reason
+                # Kept (not downloaded) as the scene's backup in case the AI budget runs out.
+                self._stock_backups[scene_index] = selected_candidate
 
             if approved_candidate is not None:
                 try:
-                    asset_bytes = self._download_url_bytes(approved_candidate["asset_url"])
-                    if asset_bytes:
-                        if approved_candidate["asset_type"] == "video":
-                            filename = (
-                                f"stock_video_{len(self.visual_assets)+1:02d}_"
-                                f"{approved_candidate.get('hit_id') or 'pixabay'}_"
-                                f"{approved_candidate.get('asset_variant') or 'clip'}.mp4"
-                            )
-                        else:
-                            filename = f"stock_image_{len(self.visual_assets)+1:02d}_{approved_candidate.get('hit_id') or 'pixabay'}.jpg"
-
-                        source_label = approved_candidate.get("source", "Pixabay")
-                        path = self._persist_binary_asset(
-                            asset_bytes,
-                            filename,
-                            source_label,
-                            approved_candidate["asset_type"],
-                            scene_index=scene_index,
-                        )
-                        self._record_stock_asset_cost(source_label.lower(), approved_candidate["asset_type"], scene_index=scene_index)
-                        local_asset_path = path
-                        if self.visual_assets and self.visual_assets[-1].get("path") == path:
-                            self.visual_assets[-1].update(
-                                {
-                                    "pixabay_hit_id": approved_candidate.get("hit_id"),
-                                    "pixabay_query": approved_candidate.get("best_query"),
-                                    "pixabay_query_type": approved_candidate.get("best_query_type"),
-                                    "pixabay_tags": approved_candidate.get("top_tags", []),
-                                }
-                            )
-                            assets_by_scene[scene_index] = self.visual_assets[-1]
-                        else:
-                            assets_by_scene[scene_index] = {
-                                "type": approved_candidate["asset_type"],
-                                "path": path,
-                                "source": source_label,
-                                "scene_index": scene_index,
-                            }
+                    asset_record = self._download_stock_candidate(approved_candidate, scene_index)
+                    if asset_record:
+                        assets_by_scene[scene_index] = asset_record
+                        local_asset_path = asset_record.get("path")
                         selected_summary = self._summarize_pixabay_candidate_for_debug(approved_candidate, selected=True)
                 except Exception as exc:
                     if get_verbose():
@@ -4110,6 +4109,56 @@ class YouTube:
             }
         )
         return assets_by_scene
+
+    def _download_stock_candidate(self, candidate: dict, scene_index: int) -> dict | None:
+        """
+        Downloads one scored stock candidate and records it as the scene's asset.
+
+        Args:
+            candidate (dict): scored Pixabay/Pexels candidate
+            scene_index (int): aligned scene order
+
+        Returns:
+            asset (dict | None): stored asset record, or None on an empty download
+        """
+        asset_bytes = self._download_url_bytes(candidate["asset_url"])
+        if not asset_bytes:
+            return None
+
+        if candidate["asset_type"] == "video":
+            filename = (
+                f"stock_video_{len(self.visual_assets)+1:02d}_"
+                f"{candidate.get('hit_id') or 'pixabay'}_"
+                f"{candidate.get('asset_variant') or 'clip'}.mp4"
+            )
+        else:
+            filename = f"stock_image_{len(self.visual_assets)+1:02d}_{candidate.get('hit_id') or 'pixabay'}.jpg"
+
+        source_label = candidate.get("source", "Pixabay")
+        path = self._persist_binary_asset(
+            asset_bytes,
+            filename,
+            source_label,
+            candidate["asset_type"],
+            scene_index=scene_index,
+        )
+        self._record_stock_asset_cost(source_label.lower(), candidate["asset_type"], scene_index=scene_index)
+        if self.visual_assets and self.visual_assets[-1].get("path") == path:
+            self.visual_assets[-1].update(
+                {
+                    "pixabay_hit_id": candidate.get("hit_id"),
+                    "pixabay_query": candidate.get("best_query"),
+                    "pixabay_query_type": candidate.get("best_query_type"),
+                    "pixabay_tags": candidate.get("top_tags", []),
+                }
+            )
+            return self.visual_assets[-1]
+        return {
+            "type": candidate["asset_type"],
+            "path": path,
+            "source": source_label,
+            "scene_index": scene_index,
+        }
 
     def _get_existing_visual_asset_scene_indices(self, target_count: int) -> set[int]:
         """
@@ -4261,12 +4310,13 @@ class YouTube:
         Returns:
             count (int): total generated/downloaded assets
         """
-        strategy = get_asset_strategy()
+        strategy = self._get_asset_strategy()
         scene_units = self._get_scene_units()
         target_count = len(scene_units)
         ai_used = 0
         estimated_scene_durations = self._estimate_scene_durations_for_asset_search()
         self._pixabay_selection_debug = []
+        self._stock_backups = {}
         pixabay_assets_by_scene: dict[int, dict] = {}
 
         if strategy in ("mixed", "pixabay_only") and scene_units:
@@ -4280,20 +4330,35 @@ class YouTube:
                 estimated_scene_durations,
             )
 
-        max_ai_assets = get_max_ai_assets() if strategy in ("mixed", "ai_only") else 0
+        max_ai_assets = self._get_max_ai_assets() if strategy in ("mixed", "ai_only") else 0
 
-        for scene_index, scene_text in enumerate(scene_units):
+        # Spend the AI budget where stock is weakest: scenes with no candidate
+        # first, then the lowest-scoring rejected ones.
+        missing = [index for index in range(target_count) if index not in pixabay_assets_by_scene]
+        missing.sort(key=lambda index: self._get_pixabay_selection_score(self._stock_backups.get(index)))
+        for scene_index in missing:
+            if strategy not in ("mixed", "ai_only") or ai_used >= max_ai_assets:
+                break
             prompt = self.image_prompts[scene_index] if scene_index < len(self.image_prompts) else self.image_prompts[-1]
-            asset_created = scene_index in pixabay_assets_by_scene
+            try:
+                if self.generate_image(prompt, scene_index=scene_index):
+                    ai_used += 1
+            except ImageRateLimitError:
+                raise
 
-            if not asset_created and strategy in ("mixed", "ai_only"):
-                if ai_used < max_ai_assets:
-                    try:
-                        asset_created = bool(self.generate_image(prompt, scene_index=scene_index))
-                        if asset_created:
-                            ai_used += 1
-                    except ImageRateLimitError:
-                        raise
+        def fill_from_stock_backups() -> None:
+            # Budget spent: a below-threshold stock clip still beats repeating the previous scene.
+            existing = self._get_existing_visual_asset_scene_indices(target_count)
+            for scene_index, candidate in sorted(self._stock_backups.items()):
+                if scene_index in existing or scene_index >= target_count:
+                    continue
+                try:
+                    if self._download_stock_candidate(candidate, scene_index):
+                        existing.add(scene_index)
+                except Exception as exc:
+                    warning(f"Backup stock clip for scene {scene_index + 1} failed: {exc}")
+
+        fill_from_stock_backups()
 
         for retry_round in range(1, VISUAL_ASSET_RETRY_ROUNDS + 1):
             existing_scene_indices = self._get_existing_visual_asset_scene_indices(target_count)
@@ -4344,6 +4409,7 @@ class YouTube:
                     except ImageRateLimitError:
                         raise
 
+            fill_from_stock_backups()
             current_count = len(self._get_existing_visual_asset_scene_indices(target_count))
             if current_count <= previous_count:
                 break
@@ -4748,6 +4814,13 @@ class YouTube:
         if not scene_units:
             return [max(total_duration, 0.1)]
 
+        # TTS word timings (Edge) give exact scene cuts for free.
+        spans = self._align_units_to_word_timings(scene_units, self._load_tts_word_timings())
+        if spans:
+            starts = [0.0] + [start for start, _ in spans[1:]]
+            ends = starts[1:] + [total_duration]
+            return [max(0.1, end - start) for start, end in zip(starts, ends)]
+
         # Try Whisper-based alignment for accurate sync
         if hasattr(self, 'tts_path') and self.tts_path and get_stt_provider() == "local_whisper":
             try:
@@ -4758,6 +4831,56 @@ class YouTube:
                 warning(f"Whisper scene alignment failed, using text-weight fallback: {e}")
 
         return self._get_scene_durations_by_weight(total_duration, scene_units)
+
+    def _load_tts_word_timings(self, audio_path: str | None = None) -> list[dict]:
+        """
+        Loads the [{word, start, end}] sidecar the TTS wrote for the voiceover
+        (Edge only), keeping just real words (drops emoji/punctuation tokens).
+
+        Args:
+            audio_path (str | None): voiceover path, defaults to self.tts_path
+
+        Returns:
+            words (list[dict]): spoken words in order, or [] when unavailable
+        """
+        path = audio_path or getattr(self, "tts_path", None)
+        if not path:
+            return []
+        try:
+            with open(word_timings_path(path), "r", encoding="utf-8") as file:
+                words = json.load(file)
+        except (OSError, ValueError):
+            return []
+        return [word for word in words if re.search(r"\w", str(word.get("word", "")))]
+
+    def _align_units_to_word_timings(self, units: list[str], words: list[dict]) -> list[tuple] | None:
+        """
+        Maps ordered text units (captions or scenes) to (start, end) seconds by
+        walking the spoken words in order.
+
+        Args:
+            units (list[str]): text units covering the narration in order
+            words (list[dict]): spoken words with start/end seconds
+
+        Returns:
+            spans (list[tuple] | None): one (start, end) per unit, or None when
+            the word counts disagree too much to trust the alignment
+        """
+        counts = [
+            len([token for token in re.findall(r"\S+", str(unit or "")) if re.search(r"\w", token)])
+            for unit in units
+        ]
+        if not words or abs(sum(counts) - len(words)) > max(2, 0.03 * len(words)):
+            return None
+
+        spans = []
+        index = 0
+        for count in counts:
+            first = min(index, len(words) - 1)
+            last = min(index + max(count, 1) - 1, len(words) - 1)
+            spans.append((float(words[first]["start"]), float(words[last]["end"])))
+            index += count
+        return spans
 
     def _get_scene_durations_from_whisper(self, total_duration: float, scene_units: list[str]) -> list[float]:
         """
@@ -6518,14 +6641,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         audio_clip = AudioFileClip(audio_path)
         total_duration = max(audio_clip.duration, 0.1)
         total_chars = sum(len(unit) for unit in subtitle_units) or len(subtitle_units)
+        # Exact per-word timings from the TTS (Edge) beat character-count guessing,
+        # which drifts later with every pause in the narration.
+        spans = self._align_units_to_word_timings(subtitle_units, self._load_tts_word_timings(audio_path))
 
         lines = []
         current_time = 0.0
         min_duration = 0.1 if get_subtitle_mode() == "word_by_word" else 0.8
         for idx, unit in enumerate(subtitle_units, start=1):
-            unit_weight = len(unit) / total_chars if total_chars else 1 / len(subtitle_units)
-            duration = max(total_duration * unit_weight, min_duration)
-            end_time = min(total_duration, current_time + duration)
+            if spans:
+                # Each caption holds until the next spoken unit begins (no flicker in pauses).
+                current_time = spans[idx - 1][0]
+                end_time = spans[idx][0] if idx < len(spans) else total_duration
+            else:
+                unit_weight = len(unit) / total_chars if total_chars else 1 / len(subtitle_units)
+                duration = max(total_duration * unit_weight, min_duration)
+                end_time = min(total_duration, current_time + duration)
 
             if idx == len(subtitle_units):
                 end_time = total_duration
@@ -7302,23 +7433,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for trigger, sfx_file in sfx_map.items():
             normalized_map[strip_word(trigger)] = sfx_file
 
-        # Get word-level timestamps from cached Whisper transcription
-        try:
-            segments, _, _, _ = self._transcribe_with_whisper(
-                audio_path, word_timestamps=True,
-            )
+        # Prefer the TTS's own word timings (instant); Whisper only when unavailable.
+        words_with_times = [
+            {"word": strip_word(word["word"]), "start": word["start"]}
+            for word in self._load_tts_word_timings(audio_path)
+        ]
+        if not words_with_times:
+            try:
+                segments, _, _, _ = self._transcribe_with_whisper(
+                    audio_path, word_timestamps=True,
+                )
 
-            words_with_times = []
-            for segment in segments:
-                if segment.words:
-                    for word in segment.words:
-                        words_with_times.append({
-                            "word": strip_word(str(word.word)),
-                            "start": word.start,
-                        })
-        except Exception as e:
-            warning(f"SFX: Whisper word timestamps failed: {e}")
-            return []
+                for segment in segments:
+                    if segment.words:
+                        for word in segment.words:
+                            words_with_times.append({
+                                "word": strip_word(str(word.word)),
+                                "start": word.start,
+                            })
+            except Exception as e:
+                warning(f"SFX: Whisper word timestamps failed: {e}")
+                return []
 
         # Match trigger words and build SFX clips
         sfx_clips = []

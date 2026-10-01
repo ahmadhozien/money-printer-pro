@@ -72,6 +72,7 @@
   "subtitle_stroke_color": "#000000",
   "subtitle_stroke_width": 6,
   "youtube_metadata_model": "",
+  "youtube_script_model": "",
   "pricing": {
     "currency": "USD",
     "text_generation": {

@@ -13,6 +13,10 @@ DEFAULT_PRICING_CONFIG = {
     "text_generation": {
         "openai": {
             "models": {
+                "gpt-5": {
+                    "input_per_1m_tokens": 1.25,
+                    "output_per_1m_tokens": 10.00,
+                },
                 "gpt-5-mini": {
                     "input_per_1m_tokens": 0.25,
                     "output_per_1m_tokens": 2.00,
@@ -740,6 +744,17 @@ def get_youtube_metadata_model() -> str:
     """
     with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
         return json.load(file).get("youtube_metadata_model", "")
+
+def get_youtube_script_model() -> str:
+    """
+    Gets the optional model override used only for writing narration scripts
+    (e.g. a stronger model for scripts while everything else stays cheap).
+    A channel's own "script_model" field takes precedence.
+
+    Returns:
+        model (str): model name or empty string
+    """
+    return str(_read_config().get("youtube_script_model", "") or "").strip()
 
 def get_assemblyai_api_key() -> str:
     """
